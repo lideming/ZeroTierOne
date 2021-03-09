@@ -229,31 +229,25 @@ void Peer::received(
 
 SharedPtr<Path> Peer::getAppropriatePath(int64_t now, bool includeExpired, int32_t flowId)
 {
-	if (!_bondToPeer) {
-		Mutex::Lock _l(_paths_m);
-		unsigned int bestPath = ZT_MAX_PEER_NETWORK_PATHS;
-		/**
-		 * Send traffic across the highest quality path only. This algorithm will still
-		 * use the old path quality metric from protocol version 9.
-		 */
-		long bestPathQuality = 2147483647;
-		for(unsigned int i=0;i<ZT_MAX_PEER_NETWORK_PATHS;++i) {
-			if (_paths[i].p) {
-				if ((includeExpired)||((now - _paths[i].lr) < ZT_PEER_PATH_EXPIRATION)) {
-					const long q = _paths[i].p->quality(now) / _paths[i].priority;
-					if (q <= bestPathQuality) {
-						bestPathQuality = q;
-						bestPath = i;
-					}
+	Mutex::Lock _l(_paths_m);
+
+	unsigned int bestPath = ZT_MAX_PEER_NETWORK_PATHS;
+	long bestPathQuality = 2147483647;
+	for(unsigned int i=0;i<ZT_MAX_PEER_NETWORK_PATHS;++i) {
+		if (_paths[i].p) {
+			if ((includeExpired)||((now - _paths[i].lr) < ZT_PEER_PATH_EXPIRATION)) {
+				const long q = _paths[i].p->quality(now) / _paths[i].priority;
+				if (q <= bestPathQuality) {
+					bestPathQuality = q;
+					bestPath = i;
 				}
-			} else break;
-		}
-		if (bestPath != ZT_MAX_PEER_NETWORK_PATHS) {
-			return _paths[bestPath].p;
-		}
-		return SharedPtr<Path>();
+			}
+		} else break;
 	}
-	return _bondToPeer->getAppropriatePath(now, flowId);
+
+	if (bestPath != ZT_MAX_PEER_NETWORK_PATHS)
+		return _paths[bestPath].p;
+	return SharedPtr<Path>();
 }
 
 void Peer::introduce(void *const tPtr,const int64_t now,const SharedPtr<Peer> &other) const
