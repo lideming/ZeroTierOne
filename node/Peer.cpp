@@ -93,11 +93,8 @@ void Peer::received(
 		case Packet::VERB_MULTICAST_FRAME:
 			_lastNontrivialReceive = now;
 			break;
-		default:
-			break;
+		default: break;
 	}
-
-	recordIncomingPacket(path, packetId, payloadLength, verb, flowId, now);
 
 	if (trustEstablished) {
 		_lastTrustEstablishedPacketReceived = now;
@@ -106,6 +103,7 @@ void Peer::received(
 
 	if (hops == 0) {
 		// If this is a direct packet (no hops), update existing paths or learn new ones
+
 		bool havePath = false;
 		{
 			Mutex::Lock _l(_paths_m);
@@ -116,29 +114,35 @@ void Peer::received(
 						havePath = true;
 						break;
 					}
-				} else {
-					break;
-				}
+				} else break;
 			}
 		}
 
-		if ( (!havePath) && RR->node->shouldUsePathForZeroTierTraffic(tPtr,_id.address(),path->localSocket(),path->address()) ) {
-			if (verb == Packet::VERB_OK) {
-				Mutex::Lock _l(_paths_m);
+		bool attemptToContact = false;
+		if ((!havePath)&&(RR->node->shouldUsePathForZeroTierTraffic(tPtr,_id.address(),path->localSocket(),path->address()))) {
+			Mutex::Lock _l(_paths_m);
 
+			// Paths are redunant if they duplicate an alive path to the same IP or
+			// with the same local socket and address family.
+			bool redundant = false;
+			for(unsigned int i=0;i<ZT_MAX_PEER_NETWORK_PATHS;++i) {
+				if (_paths[i].p) {
+					if ( (_paths[i].p->alive(now)) && ( ((_paths[i].p->localSocket() == path->localSocket())&&(_paths[i].p->address().ss_family == path->address().ss_family)) || (_paths[i].p->address().ipsEqual2(path->address())) ) )  {
+						redundant = true;
+						break;
+					}
+				} else break;
+			}
+
+			if (!redundant) {
 				unsigned int replacePath = ZT_MAX_PEER_NETWORK_PATHS;
-				long replacePathQuality = 0;
+				int replacePathQuality = 0;
 				for(unsigned int i=0;i<ZT_MAX_PEER_NETWORK_PATHS;++i) {
 					if (_paths[i].p) {
-						if ( (!_paths[i].p->alive(now)) || _paths[i].p->address().ipsEqual(path->address()) ) {
+						const int q = _paths[i].p->quality(now);
+						if (q > replacePathQuality) {
+							replacePathQuality = q;
 							replacePath = i;
-							break;
-						} else {
-							const long q = _paths[i].p->quality(now) / _paths[i].priority;
-							if (q > replacePathQuality) {
-								replacePathQuality = q;
-								replacePath = i;
-							}
 						}
 					} else {
 						replacePath = i;
@@ -147,51 +151,61 @@ void Peer::received(
 				}
 
 				if (replacePath != ZT_MAX_PEER_NETWORK_PATHS) {
-					RR->t->peerLearnedNewPath(tPtr, networkId, *this, path, packetId);
-					_paths[replacePath].lr = now;
-					_paths[replacePath].p = path;
-					_paths[replacePath].priority = 1;
-				}
-			} else {
-				Mutex::Lock ltl(_lastTriedPath_m);
-
-				bool triedTooRecently = false;
-				for(std::list< std::pair< Path *, int64_t > >::iterator i(_lastTriedPath.begin());i!=_lastTriedPath.end();) {
-					if ((now - i->second) > 1000) {
-						_lastTriedPath.erase(i++);
-					} else if (i->first == path.ptr()) {
-						++i;
-						triedTooRecently = true;
+					if (verb == Packet::VERB_OK) {
+						RR->t->peerLearnedNewPath(tPtr,networkId,*this,path,packetId);
+						_paths[replacePath].lr = now;
+						_paths[replacePath].p = path;
+						_paths[replacePath].priority = 1;
 					} else {
-						++i;
+						attemptToContact = true;
 					}
 				}
-
-				if (!triedTooRecently) {
-					_lastTriedPath.push_back(std::pair< Path *, int64_t >(path.ptr(), now));
-					attemptToContactAt(tPtr,path->localSocket(),path->address(),now,true);
-					path->sent(now);
-					RR->t->peerConfirmingUnknownPath(tPtr,networkId,*this,path,packetId,verb);
-				}
 			}
+		}
+
+		if (attemptToContact) {
+			attemptToContactAt(tPtr,path->localSocket(),path->address(),now,true);
+			path->sent(now);
+			RR->t->peerConfirmingUnknownPath(tPtr,networkId,*this,path,packetId,verb);
 		}
 	}
 
 	// If we have a trust relationship periodically push a message enumerating
-	// all known external addresses for ourselves. If we already have a path this
-	// is done less frequently.
+	// all known external addresses for ourselves. We now do this even if we
+	// have a current path since we'll want to use new ones too.
 	if (this->trustEstablished(now)) {
-		const int64_t sinceLastPush = now - _lastDirectPathPushSent;
-		if (sinceLastPush >= ((hops == 0) ? ZT_DIRECT_PATH_PUSH_INTERVAL_HAVEPATH : ZT_DIRECT_PATH_PUSH_INTERVAL)) {
+		if ((now - _lastDirectPathPushSent) >= ZT_DIRECT_PATH_PUSH_INTERVAL) {
 			_lastDirectPathPushSent = now;
-			std::vector<InetAddress> pathsToPush(RR->node->directPaths());
-			if (!pathsToPush.empty()) {
+
+			std::vector<InetAddress> pathsToPush;
+
+			std::vector<InetAddress> dps(RR->node->directPaths());
+			for(std::vector<InetAddress>::const_iterator i(dps.begin());i!=dps.end();++i)
+				pathsToPush.push_back(*i);
+
+			// Do symmetric NAT prediction if we are communicating indirectly.
+			/*
+			if (hops > 0) {
+				std::vector<InetAddress> sym(RR->sa->getSymmetricNatPredictions());
+				for(unsigned long i=0,added=0;i<sym.size();++i) {
+					InetAddress tmp(sym[(unsigned long)RR->node->prng() % sym.size()]);
+					if (std::find(pathsToPush.begin(),pathsToPush.end(),tmp) == pathsToPush.end()) {
+						pathsToPush.push_back(tmp);
+						if (++added >= ZT_PUSH_DIRECT_PATHS_MAX_PER_SCOPE_AND_FAMILY)
+							break;
+					}
+				}
+			}
+			*/
+
+			if (pathsToPush.size() > 0) {
 				std::vector<InetAddress>::const_iterator p(pathsToPush.begin());
 				while (p != pathsToPush.end()) {
-					Packet *const outp = new Packet(_id.address(),RR->identity.address(),Packet::VERB_PUSH_DIRECT_PATHS);
-					outp->addSize(2); // leave room for count
+					Packet outp(_id.address(),RR->identity.address(),Packet::VERB_PUSH_DIRECT_PATHS);
+					outp.addSize(2); // leave room for count
+
 					unsigned int count = 0;
-					while ((p != pathsToPush.end())&&((outp->size() + 24) < 1200)) {
+					while ((p != pathsToPush.end())&&((outp.size() + 24) < 1200)) {
 						uint8_t addressType = 4;
 						switch(p->ss_family) {
 							case AF_INET:
@@ -204,23 +218,22 @@ void Peer::received(
 								continue;
 						}
 
-						outp->append((uint8_t)0); // no flags
-						outp->append((uint16_t)0); // no extensions
-						outp->append(addressType);
-						outp->append((uint8_t)((addressType == 4) ? 6 : 18));
-						outp->append(p->rawIpData(),((addressType == 4) ? 4 : 16));
-						outp->append((uint16_t)p->port());
+						outp.append((uint8_t)0); // no flags
+						outp.append((uint16_t)0); // no extensions
+						outp.append(addressType);
+						outp.append((uint8_t)((addressType == 4) ? 6 : 18));
+						outp.append(p->rawIpData(),((addressType == 4) ? 4 : 16));
+						outp.append((uint16_t)p->port());
 
 						++count;
 						++p;
 					}
+
 					if (count) {
-						outp->setAt(ZT_PACKET_IDX_PAYLOAD,(uint16_t)count);
-						outp->compress();
-						outp->armor(_key,true,aesKeysIfSupported());
-						path->send(RR,tPtr,outp->data(),outp->size(),now);
+						outp.setAt(ZT_PACKET_IDX_PAYLOAD,(uint16_t)count);
+						outp.armor(_key,true,NULL);
+						path->send(RR,tPtr,outp.data(),outp.size(),now);
 					}
-					delete outp;
 				}
 			}
 		}
